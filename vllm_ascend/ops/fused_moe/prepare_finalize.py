@@ -399,7 +399,9 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if enable_sp() or enable_sp_by_pass():
             return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
 
-        return self._prepare_with_dp_group(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce)
+        return self._prepare_with_dp_group(
+            hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce, quant_type
+        )
 
     def _prepare_with_ep_group(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, quant_type=QuantType.NONE

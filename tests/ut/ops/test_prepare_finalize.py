@@ -10,6 +10,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAllGather,
     PrepareAndFinalizeWithMC2,
 )
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig, apply_mxfp8_block_rotation
 from vllm_ascend.quantization.quant_type import QuantType
 
 
@@ -246,3 +247,60 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         mock_rotate.assert_called_once()
         self.assertTrue(torch.allclose(prepare_output.hidden_states, hidden_states + 1))
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp_by_pass", return_value=False)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp", return_value=False)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.apply_mxfp8_block_rotation", wraps=apply_mxfp8_block_rotation)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_current_vllm_config")
+    def test_allgather_mxfp8_prepare_rotates_without_sequence_parallel(
+        self, mock_get_current_vllm_config, mock_rotate, mock_enable_sp, mock_enable_sp_by_pass
+    ):
+        mock_get_current_vllm_config.return_value = SimpleNamespace(
+            quant_config=SimpleNamespace(
+                quant_description={"group_size": 32, "rotation_enable": True, "rotation_seed": 5}
+            )
+        )
+        layer = PrepareAndFinalizeWithAllGather(self.moe_config)
+        hidden_states = torch.randn(3, 32)
+        router_logits = torch.randn(3, 2)
+
+        prepare_output = layer.prepare(hidden_states, router_logits, quant_type=QuantType.MXFP8)
+
+        mock_rotate.assert_called_once()
+        self.assertIs(mock_rotate.call_args.args[0], hidden_states)
+        rotation = MXFP8RotationConfig(enable=True, seed=5)
+        expected = apply_mxfp8_block_rotation(hidden_states, rotation)
+        self.assertTrue(torch.equal(prepare_output.hidden_states, expected))
+        # Exported weights use the same feature rotation; the unquantized
+        # product must preserve the original coordinates, without a second rotation.
+        weight = torch.randn(8, 32)
+        rotated_weight = apply_mxfp8_block_rotation(weight, rotation)
+        torch.testing.assert_close(prepare_output.hidden_states @ rotated_weight.T, hidden_states @ weight.T)
+        self.assertIs(prepare_output.router_logits, router_logits)
+        # This path quantizes during token dispatch, after the prepare rotation.
+        self.assertIsNone(prepare_output.pertoken_scale)
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp_by_pass", return_value=False)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp", return_value=False)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.apply_mxfp8_block_rotation")
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_current_vllm_config")
+    def test_allgather_prepare_preserves_inputs_without_fprop_rotation(
+        self, mock_get_current_vllm_config, mock_rotate, mock_enable_sp, mock_enable_sp_by_pass
+    ):
+        hidden_states = torch.randn(3, 32)
+        router_logits = torch.randn(3, 2)
+        for quant_type, description in (
+            (QuantType.NONE, {"rotation_enable": True}),
+            (QuantType.MXFP8, {"rotation_enable": False}),
+            (QuantType.MXFP8, {"rotation_enable": True, "rotation_targets": ["dgrad"]}),
+        ):
+            with self.subTest(quant_type=quant_type, description=description):
+                mock_get_current_vllm_config.return_value = SimpleNamespace(
+                    quant_config=SimpleNamespace(quant_description=description)
+                )
+                layer = PrepareAndFinalizeWithAllGather(self.moe_config)
+                prepare_output = layer.prepare(hidden_states, router_logits, quant_type=quant_type)
+                self.assertIs(prepare_output.hidden_states, hidden_states)
+                self.assertIs(prepare_output.router_logits, router_logits)
+                self.assertIsNone(prepare_output.pertoken_scale)
+        mock_rotate.assert_not_called()

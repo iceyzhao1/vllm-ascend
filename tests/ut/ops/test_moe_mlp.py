@@ -286,6 +286,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
             scale_type=None,
             per_token_scale_type=None,
             use_bf16=True,
+            activation=MoEActivation.SILU,
             swiglu_limit=0,
             rotation_config=rotation_config,
         )
